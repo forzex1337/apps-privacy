@@ -19,6 +19,7 @@ Current policies:
 
 ```text
 index.html              landing page with links to each game policy
+app-ads.txt             AdMob publisher authorization
 404.html
 robots.txt
 sitemap.xml
