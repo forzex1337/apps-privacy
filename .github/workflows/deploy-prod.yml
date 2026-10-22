@@ -1,0 +1,122 @@
+# Deploy strony apps.uwertaoflegends.com (polityki prywatności gier mobilnych Uwerta).
+# Wyzwalany pushem na `production`.
+#
+# ⚠️ Ta strona ODBIEGA od wzorca wizytówek .NET i to jest świadome — workflow jest kopią
+# wdrożenia `transmisja.artnetdev.com` (RUNBOOK 4l) z innym blokiem `env`. Repozytorium to
+# same pliki HTML, bez projektu .NET i bez kroku budowania. Nie ma procesu, unitu systemd
+# ani portu na pętli zwrotnej — wydaniem są pliki z gita.
+# Pliki serwuje bezpośrednio Caddy (`root` + `file_server`), a wdrożeniem jest samo
+# przepięcie dowiązania `current`. Z tego samego powodu ten workflow NIE potrzebuje sudo.
+#
+# Wdrożenie zostaje ATOMOWE: wydanie obok działającej wersji → przepięcie `current` →
+# health check → automatyczne cofnięcie dowiązania przy niepowodzeniu. RUNBOOK 4l.
+#
+# Runner jest self-hosted (serwer za NAT-em, łączy się wychodząco), etykieta `sites` jest
+# wspólna dla wszystkich wizytówek.
+name: Deploy PRODUCTION
+
+on:
+  push:
+    branches: [production]
+    # Pliki niebiorące udziału w stronie nie mają czego wdrażać.
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-apps-privacy
+  cancel-in-progress: false
+
+env:
+  SITE_DIR: /srv/www/apps.uwertaoflegends.com
+  DOMAIN: apps.uwertaoflegends.com
+  KEEP_RELEASES: '5'
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, sites]
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Nowe wydanie z plików repozytorium
+        run: |
+          SHA=$(git rev-parse --short=7 HEAD)
+          echo "SHA=$SHA" >> "$GITHUB_ENV"
+          # Poprzednie wydanie zapamiętane PRZED przepięciem — bez tego nie ma do czego wrócić.
+          echo "PREV=$(readlink "$SITE_DIR/current" || echo '')" >> "$GITHUB_ENV"
+          DEST="$SITE_DIR/releases/$SHA"
+          rm -rf "$DEST"
+          mkdir -p "$DEST"
+          # Nie ma czego budować — wydaniem są śledzone pliki z gita. `git archive` bierze
+          # wyłącznie to, co jest w commicie (bez `.git` i bez śmieci z katalogu roboczego),
+          # a wykluczenia trzymają poza stroną to, czego nie ma kto serwować.
+          git archive --format=tar HEAD -- . \
+              ':(exclude).github' ':(exclude).gitignore' ':(exclude).gitattributes' ':(exclude)*.md' \
+            | tar -x -C "$DEST"
+
+          # Sprawdzamy TREŚĆ wyniku, nie kod wyjścia potoku.
+          test -s "$DEST/index.html" || { echo "::error::brak index.html w wydaniu"; exit 1; }
+          echo "wydanie w $DEST ($(du -sh "$DEST" | cut -f1)):"
+          find "$DEST" -type f -printf '  %P  %s B\n'
+
+      - name: Prawa dostępu dla edge'a
+        run: |
+          # Czytelnikiem w czasie pracy jest `caddy` (file_server), nie `sites` — nie ma tu
+          # procesu Kestrela. Grupę `caddy` nadaje setgid na `releases/`, bo konto runnera
+          # do tej grupy NIE należy i `chgrp` by mu się nie udał.
+          chmod -R o-rwx "$SITE_DIR/releases/$SHA"
+          test "$(stat -c '%G' "$SITE_DIR/releases/$SHA")" = "caddy" \
+            || { echo "::error::wydanie ma grupę $(stat -c '%G' "$SITE_DIR/releases/$SHA"), nie caddy — Caddy dostanie 403"; exit 1; }
+
+      - name: Przepięcie current
+        run: |
+          # Caddy rozwiązuje `root` przy każdym żądaniu, więc przepięcie dowiązania
+          # wystarcza za wdrożenie — edge nie wymaga reloadu.
+          ln -sfn "releases/$SHA" "$SITE_DIR/current"
+
+      - name: Health check z automatycznym rollbackiem
+        run: |
+          # Odpytujemy przez Caddy'ego, nie z dysku — to jedyny sposób, żeby złapać także
+          # błąd uprawnień (403) i błąd konfiguracji edge'a.
+          # `--resolve` na 127.0.0.1 jest konieczne: z wnętrza LAN-u adres publiczny
+          # odpowiada routerem, nie serwerem (brak hairpin NAT).
+          # Sam kod 200 nie wystarcza: strona to jeden plik, więc porównujemy, czy edge oddaje
+          # DOKŁADNIE ten `index.html`, który właśnie trafił do wydania.
+          want=$(sha256sum < "$SITE_DIR/releases/$SHA/index.html" | cut -d' ' -f1)
+          body=$(mktemp)
+          ok=0
+          for i in $(seq 1 20); do
+            code=$(curl -s -o "$body" -w '%{http_code}' --max-time 10 \
+                   --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/" || true)
+            got=$(sha256sum < "$body" | cut -d' ' -f1)
+            if [ "$code" = "200" ] && [ "$got" = "$want" ]; then
+              echo "strona odpowiada po $((i*3))s i oddaje wydanie $SHA"
+              ok=1
+              break
+            fi
+            echo "proba $i/20 - / => HTTP ${code:-brak}, tresc $([ "$got" = "$want" ] && echo zgodna || echo NIEZGODNA)"
+            sleep 3
+          done
+          rm -f "$body"
+
+          if [ "$ok" = "1" ]; then exit 0; fi
+
+          echo "::error::Strona nie oddala nowego wydania po przepieciu"
+          journalctl -u caddy -n 60 --no-pager || true
+          if [ -n "$PREV" ]; then
+            echo "::warning::Cofam current na $PREV"
+            ln -sfn "$PREV" "$SITE_DIR/current"
+          fi
+          exit 1
+
+      - name: Sprzątanie starych wydań
+        if: success()
+        run: |
+          cd "$SITE_DIR/releases"
+          # Nigdy nie usuwaj wydania, na które wskazuje `current`, nawet gdyby wypadło z okna.
+          keep=$(basename "$(readlink "$SITE_DIR/current")")
+          ls -1t | tail -n +$((KEEP_RELEASES + 1)) | grep -vx "$keep" | xargs -r rm -rf
+          echo "pozostawione wydania:"
+          ls -1t | sed 's/^/  /'
